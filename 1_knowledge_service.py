@@ -75,6 +75,18 @@ class KnowledgeService:
                 doc.metadata = {}
             doc.metadata["source_kb"] = kb_id
             
+            # Ensure observation_final_translated and solution_final_translated fields are properly initialized
+            if "observation_final_translated" not in doc.metadata:
+                # Try to extract from content if possible
+                doc.metadata["observation_final_translated"] = getattr(doc, "page_content", "")
+                
+            if "solution_final_translated" not in doc.metadata:
+                doc.metadata["solution_final_translated"] = ""
+                
+            # Preserve language field if it exists for translation service
+            if "language" not in doc.metadata:
+                doc.metadata["language"] = "en"  # Default to English if not specified
+            
         # Apply filters if provided
         if filter_criteria:
             results = self._apply_filters(results, filter_criteria)
@@ -101,6 +113,26 @@ class KnowledgeService:
             all_results.extend(results)
             
         return all_results
+    
+    async def search_all_kbs(
+        self, query_variations: List[str], 
+        top_results: int = 10, 
+        filter_criteria: Optional[Dict[str, Any]] = None
+    ) -> List[Document]:
+        """Search all KBs with multiple query variations."""
+        if isinstance(query_variations, str):
+            query_variations = [query_variations]
+            
+        all_results = []
+        for query in query_variations:
+            results = await self.retrieve_from_all_kbs(query, top_results, filter_criteria)
+            # Mark which query variation produced these results
+            for doc in results:
+                doc.metadata["query_variation"] = query
+            all_results.extend(results)
+            
+        # Deduplicate results
+        return self._deduplicate_results(all_results)
     
     def _apply_filters(self, results: List[Document], filter_criteria: Dict[str, Any]) -> List[Document]:
         """Apply filters to retrieval results."""
