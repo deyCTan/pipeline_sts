@@ -31,128 +31,157 @@ class RAGPipeline:
         self.translation_service = translation_service
         self.retrieval_service = retrieval_service
     
-    async def process_query(self, query, source_language="auto", search_type="global", project_name=None):
-    start_time = time.time()
-    
-    try:
-        # Step 1: Detect language and translate query if needed
-        detection_result = await self.translation_service.detect_language(query)
-        detected_language = detection_result.get("detected_language", source_language)
+    async def process_query(self, query, source_language="auto", target_language=None, search_type="global", project_name=None):
+        """
+        Process a user query through the RAG pipeline.
         
-        # Translate query to English if not already in English
-        english_query = query
-        if detected_language != "en" and detected_language != "english":
-            translation_result = await self.translation_service.translate_text(
-                query, source_language=detected_language, target_language="en"
-            )
-            english_query = translation_result.get("translated_text", query)
+        Args:
+            query: User's query string
+            source_language: Language of the query (auto for detection)
+            target_language: Preferred language for results (defaults to source_language)
+            search_type: global or local search
+            project_name: Optional project filter for local search
             
-        # Step 2: Generate query variations and retrieve results
-        query_variations = await self.retrieval_service.generate_query_variations(english_query)
+        Returns:
+            Dictionary with search results and metadata
+        """
+        start_time = time.time()
         
-        # Retrieve results from all knowledge bases
-        all_results = await self.knowledge_service.search_all_kbs(query_variations)
-        
-        # Step 3: Apply Reciprocal Rank Fusion to get unique documents
-        unique_results = self.retrieval_service.rerank_results(all_results, english_query)
-        
-        # Step 4: Filter by project if needed
-        if search_type == "local" and project_name:
-            filtered_results = [
-                doc for doc in unique_results 
-                if getattr(doc, "metadata", {}).get("project", "") == project_name
-            ]
-        else:
-            filtered_results = unique_results
-
-        # Step 5: Now translate only the unique filtered results back to source language
-        observation_texts = []
-        solution_texts = []
-
-        for result in filtered_results:
-            metadata = getattr(result, "metadata", {})
-
-            # Extract observation field with null checking
-            obs_text = None
-            if hasattr(result, "observation"):
-                obs_text = result.observation
-            elif "observation_final_translated" in metadata:
-                obs_text = metadata["observation_final_translated"]
-            elif "observation" in metadata:
-                obs_text = metadata["observation"]
-
-            # Add observation text (empty string if None)
-            observation_texts.append(obs_text if obs_text is not None else "")
-
-            # Extract solution field with null checking
-            sol_text = None
-            if hasattr(result, "solution"):
-                sol_text = result.solution
-            elif "solution_final_translated" in metadata:
-                sol_text = metadata["solution_final_translated"]
-            elif "solution" in metadata:
-                sol_text = metadata["solution"]
-
-            # Add solution text (empty string if None)
-            solution_texts.append(sol_text if sol_text is not None else "")
-
-        # Translate observations and solutions back to source language
-        if detected_language != "en" and detected_language != "english":
-            logger.info(f"Preparing to translate {len(filtered_results)} results to {detected_language}")
-
-            # Translate observations
-            if observation_texts:
-                obs_translations = await self.translation_service.translate_batch(
-                    observation_texts, source_language="en", target_language=detected_language
+        try:
+            # Set target_language to source_language if not explicitly provided
+            if target_language is None:
+                target_language = source_language
+                
+            # Step 1: Detect language if auto-detection is requested
+            detected_language = source_language
+            if source_language == "auto":
+                detection_result = await self.translation_service.detect_language(query)
+                detected_language = detection_result.get("detected_language", "en")
+                logger.info(f"Detected query language: {detected_language}")
+            
+            # Update target language if it wasn't explicitly set
+            if target_language == "auto":
+                target_language = detected_language
+                
+            # Store original language for later use
+            original_language = detected_language
+            
+            # Step 2: Translate query to English if needed
+            english_query = query
+            if detected_language != "en" and detected_language != "english":
+                translation_result = await self.translation_service.translate_text(
+                    query, source_language=detected_language, target_language="en"
                 )
-                translated_observations = obs_translations.get("translated_texts", observation_texts)
+                english_query = translation_result.get("translated_text", query)
+                logger.info(f"Translated query to English: {english_query}")
+                
+            # Step 3: Generate query variations and retrieve results
+            query_variations = await self.retrieval_service.generate_query_variations(
+                english_query, query_language="en"
+            )
+            
+            # Step 4: Retrieve results from all knowledge bases
+            all_results = await self.knowledge_service.search_all_kbs(query_variations)
+            
+            # Step 5: Apply Reciprocal Rank Fusion to get unique documents
+            unique_results = self.retrieval_service.rerank_results(
+                all_results, english_query, target_language=target_language
+            )
+            
+            # Step 6: Filter by project if needed
+            if search_type == "local" and project_name:
+                filtered_results = [
+                    doc for doc in unique_results 
+                    if getattr(doc, "metadata", {}).get("project", "") == project_name
+                ]
+                logger.info(f"Filtered to {len(filtered_results)} results for project: {project_name}")
             else:
-                translated_observations = []
+                filtered_results = unique_results
+                logger.info(f"Using all {len(filtered_results)} results (global search)")
 
-            # Translate solutions
-            if solution_texts:
-                sol_translations = await self.translation_service.translate_batch(
-                    solution_texts, source_language="en", target_language=detected_language
-                )
-                translated_solutions = sol_translations.get("translated_texts", solution_texts)
-            else:
-                translated_solutions = []
-        else:
-            # No translation needed, use original texts
-            translated_observations = observation_texts
-            translated_solutions = solution_texts
+            # Step 7: Extract fields for translation
+            observation_texts = []
+            solution_texts = []
 
-        # Step 6: Add translations back to results
-        for i, result in enumerate(filtered_results):
-            if i < len(translated_observations):
+            for result in filtered_results:
+                # Ensure we have a metadata dictionary
                 if not hasattr(result, "metadata"):
                     result.metadata = {}
-                result.observation = translated_observations[i]
-            if i < len(translated_solutions):
-                if not hasattr(result, "metadata"):
-                    result.metadata = {}
-                result.solution = translated_solutions[i]
-        
-        # Calculate total time
-        total_time = time.time() - start_time
-        
-        return {
-            "status": "success",
-            "results": filtered_results,
-            "total_time": total_time,
-            "metadata": {
-                "detected_language": detected_language,
-                "english_query": english_query,
-                "query_variations": query_variations,
-                "result_count": len(filtered_results)
+
+                # Extract observation field with proper fallbacks
+                obs_text = result.metadata.get("observation_final_translated", 
+                           result.metadata.get("observation", 
+                           getattr(result, "page_content", "")))
+                
+                observation_texts.append(obs_text if obs_text else "")
+
+                # Extract solution field with proper fallbacks
+                sol_text = result.metadata.get("solution_final_translated", 
+                          result.metadata.get("solution", ""))
+                
+                solution_texts.append(sol_text if sol_text else "")
+
+            # Step 8: Translate observations and solutions to target language if needed
+            if target_language != "en" and target_language != "english":
+                logger.info(f"Translating {len(filtered_results)} results to {target_language}")
+
+                # Translate observations
+                if observation_texts:
+                    obs_translations = await self.translation_service.translate_batch(
+                        observation_texts, source_language="en", target_language=target_language
+                    )
+                    translated_observations = obs_translations.get("translated_texts", observation_texts)
+                else:
+                    translated_observations = []
+
+                # Translate solutions
+                if solution_texts:
+                    sol_translations = await self.translation_service.translate_batch(
+                        solution_texts, source_language="en", target_language=target_language
+                    )
+                    translated_solutions = sol_translations.get("translated_texts", solution_texts)
+                else:
+                    translated_solutions = []
+            else:
+                # No translation needed, use original texts
+                translated_observations = observation_texts
+                translated_solutions = solution_texts
+
+            # Step 9: Add translations back to results in metadata
+            for i, result in enumerate(filtered_results):
+                if i < len(translated_observations):
+                    # Store in metadata, not as direct attributes
+                    result.metadata["observation_final_translated"] = translated_observations[i]
+                    
+                if i < len(translated_solutions):
+                    # Store in metadata, not as direct attributes 
+                    result.metadata["solution_final_translated"] = translated_solutions[i]
+                
+                # Add language information to metadata
+                result.metadata["language"] = target_language
+            
+            # Calculate total time
+            total_time = time.time() - start_time
+            
+            return {
+                "status": "success",
+                "results": filtered_results,
+                "total_time": total_time,
+                "metadata": {
+                    "detected_language": detected_language,
+                    "target_language": target_language,
+                    "english_query": english_query,
+                    "query_variations": query_variations,
+                    "result_count": len(filtered_results)
+                }
             }
-        }
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}", exc_info=True)
-        return {
-            "status": "error",
-            "error": str(e)
-        }    
+        except Exception as e:
+            logger.error(f"Error processing query: {str(e)}", exc_info=True)
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+            
     async def _translate_results(self, results: List[Any], target_language: str) -> List[Dict[str, Any]]:
         """
         Translate results back to user's language.
@@ -199,9 +228,10 @@ class RAGPipeline:
         # Filter out empty texts and translate
         if texts_to_translate:
             logger.info(f"Translating {len(texts_to_translate)} texts from English to {target_language}")
-            translated_texts = await self.translation_service.batch_translate(
+            translation_result = await self.translation_service.translate_batch(
                 texts_to_translate, source_language="en", target_language=target_language
             )
+            translated_texts = translation_result.get("translated_texts", [])
             logger.info(f"Received {len(translated_texts)} translated texts")
         else:
             logger.warning("No texts to translate")
@@ -216,15 +246,15 @@ class RAGPipeline:
             
             # Add translated observation
             if observation_indices[i] is not None and observation_indices[i] < len(translated_texts):
-                result["observation"] = translated_texts[observation_indices[i]]
+                result["observation_final_translated"] = translated_texts[observation_indices[i]]
             else:
-                result["observation"] = metadata.get("observation_final_translated", "")
+                result["observation_final_translated"] = metadata.get("observation_final_translated", "")
                 
             # Add translated solution
             if solution_indices[i] is not None and solution_indices[i] < len(translated_texts):
-                result["solution"] = translated_texts[solution_indices[i]]
+                result["solution_final_translated"] = translated_texts[solution_indices[i]]
             else:
-                result["solution"] = metadata.get("solution_final_translated", "")
+                result["solution_final_translated"] = metadata.get("solution_final_translated", "")
                 
             formatted_results.append(result)
         
@@ -241,8 +271,20 @@ class RAGPipeline:
         Returns:
             Dictionary with formatted result data
         """
-        metadata = getattr(doc, "metadata", {})
-        content = getattr(doc, "page_content", "")
+        # Handle different types of documents
+        if hasattr(doc, "metadata"):
+            metadata = doc.metadata
+        elif isinstance(doc, dict) and "metadata" in doc:
+            metadata = doc["metadata"]
+        else:
+            metadata = {}
+            
+        if hasattr(doc, "page_content"):
+            content = doc.page_content
+        elif isinstance(doc, dict) and "page_content" in doc:
+            content = doc["page_content"]
+        else:
+            content = ""
         
         result = {
             "content": content,
@@ -256,19 +298,22 @@ class RAGPipeline:
                 
         return result
     
-    def format_results(results, filter_criteria, source_language, translated_observations, translated_solutions):
+def format_results(results, filter_criteria, source_language, translated_observations, translated_solutions):
     """Format results into the desired JSON structure."""
     formatted_results = {"response": {"observation_results": []}}
     
     logger.info(f"Formatting {len(results)} results with filters: {filter_criteria}")
     logger.info(f"Translated obs count: {len(translated_observations)}, sols count: {len(translated_solutions)}")
     
+    # Define observation keys to copy from metadata
+    OBSERVATION_KEYS = ["field_name", "source", "category", "source_kb", "project"]
+    
     obs_index = 0
     sol_index = 0
     
     for idx, result in enumerate(results, start=1):
         # Debug the result structure
-        logger.info(f"Processing result #{idx}: {type(result)}")
+        logger.debug(f"Processing result #{idx}: {type(result)}")
         
         # Extract metadata more robustly
         if hasattr(result, "metadata"):
@@ -283,7 +328,7 @@ class RAGPipeline:
             metadata = {}
         
         # Debug available metadata keys
-        logger.info(f"Available metadata keys: {metadata.keys() if metadata else 'None'}")
+        logger.debug(f"Available metadata keys: {metadata.keys() if metadata else 'None'}")
             
         # Apply filters
         match = True
@@ -296,10 +341,10 @@ class RAGPipeline:
         if not match:
             continue
         
-        # Create observation with proper field extraction - be more thorough
+        # Create observation with proper field extraction
         observation = {}
         
-        # Copy directly available OBSERVATION_KEYS from metadata
+        # Copy directly available observation keys from metadata
         for key in OBSERVATION_KEYS:
             # Try multiple ways to get the field
             if key in metadata:
@@ -315,7 +360,7 @@ class RAGPipeline:
         obs_content = None
         sol_content = None
         
-        # Look for observation in multiple places
+        # Look for observation in multiple places (metadata-first approach)
         if "observation_final_translated" in metadata:
             obs_content = metadata["observation_final_translated"]
         elif "observation" in metadata:
@@ -328,7 +373,7 @@ class RAGPipeline:
             # Maybe the content itself is the observation
             obs_content = result.page_content
             
-        # Look for solution in multiple places  
+        # Look for solution in multiple places (metadata-first approach)
         if "solution_final_translated" in metadata:
             sol_content = metadata["solution_final_translated"]
         elif "solution" in metadata:
@@ -338,7 +383,7 @@ class RAGPipeline:
         elif hasattr(result, "solution"):
             sol_content = result.solution
             
-        logger.info(f"Result #{idx} - Found obs_content: {bool(obs_content)}, sol_content: {bool(sol_content)}")
+        logger.debug(f"Result #{idx} - Found obs_content: {bool(obs_content)}, sol_content: {bool(sol_content)}")
             
         # Add translated observation if available
         if obs_content and obs_index < len(translated_observations):
