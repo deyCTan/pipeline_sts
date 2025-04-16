@@ -1,421 +1,263 @@
-class DataikuRetrievalEvaluator:
-    """SentRev-based evaluation framework for retrieval quality in Dataiku"""
-    
-    def __init__(
-        self,
-        retrieval_function: Callable,
-        model_name: str = "openai/gpt-3.5-turbo-16k",
-        kb_dataset_name: str = "knowledge_documents",
-        languages: List[str] = ["en", "fr", "kk", "es", "sv", "ru"],
-        api_key: Optional[str] = None,
-        results_folder: str = "EVALUATIONS"
-    ):
-        """
-        Initialize the retrieval evaluator
-        
-        Args:
-            retrieval_function: Function that accepts query and returns ranked documents
-            model_name: LLM to use for query generation and evaluation
-            kb_dataset_name: Dataiku dataset name containing knowledge documents
-            languages: List of languages to evaluate
-            api_key: API key for accessing the LLM
-            results_folder: Dataiku folder to store evaluation results
-        """
-        self.retrieval_function = retrieval_function
-        self.kb_dataset_name = kb_dataset_name
-        self.results_folder = results_folder
-        
-        # Initialize SentRev evaluator
-        self.evaluator = SentRevEvaluator(
-            model=model_name,
-            api_key=api_key,
-            options=EvalOptions(
-                languages=languages,
-                eval_dimensions=["relevance", "context_precision"],
-                num_synthetic_queries_per_doc=3,
-                batch_size=16,
-                cache_results=True
-            )
-        )
-        
-        # Create results directory if it doesn't exist
-        os.makedirs(results_folder, exist_ok=True)
-        
-    async def load_documents_from_dataiku(
-        self, 
-        sample_size: int = 100, 
-        project_filter: Optional[str] = None,
-        language_filter: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Load documents from Dataiku dataset for evaluation
-        
-        Args:
-            sample_size: Number of documents to sample
-            project_filter: Optional filter for specific project
-            language_filter: Optional filter for specific language
-            
-        Returns:
-            List of document dictionaries
-        """
-        try:
-            # Dataiku Python API import (only executed in Dataiku)
-            import dataiku
-            from dataiku.core.intercom import backend_json_call
-            
-            # Access the dataset
-            dataset = dataiku.Dataset(self.kb_dataset_name)
-            
-            # Build filter conditions for SQL query
-            conditions = []
-            params = {}
-            
-            if project_filter:
-                conditions.append("project = :project")
-                params["project"] = project_filter
-                
-            if language_filter:
-                conditions.append("language = :language")
-                params["language"] = language_filter
-                
-            where_clause = " AND ".join(conditions) if conditions else ""
-            
-            # Sample documents from dataset
-            sql_query = f"""
-                SELECT 
-                    id, 
-                    observation_final_translated as content,
-                    language,
-                    project,
-                    created_at,
-                    source_kb
-                FROM {self.kb_dataset_name}
-                {f"WHERE {where_clause}" if where_clause else ""}
-                ORDER BY RANDOM()
-                LIMIT {sample_size}
-            """
-            
-            # Execute query
-            df = dataset.sql_query(sql_query, params)
-            
-            # Convert to SentRev document format
-            documents = []
-            for _, row in df.iterrows():
-                if not pd.isna(row['content']) and len(row['content'].strip()) > 50:
-                    documents.append({
-                        "document_id": str(row['id']),
-                        "content": row['content'],
-                        "metadata": {
-                            "language": row['language'] or "en",
-                            "project": row['project'] or "",
-                            "source_kb": row['source_kb'] or "",
-                            "created_at": row['created_at'] or datetime.now().isoformat()
-                        }
-                    })
-            
-            logger.info(f"Loaded {len(documents)} documents from Dataiku dataset")
-            return documents
-            
-        except ImportError:
-            # Fallback for non-Dataiku environments (for testing)
-            logger.warning("Dataiku not available - using mock data")
-            return self._generate_mock_documents(sample_size, language_filter)
-            
-    def _generate_mock_documents(self, sample_size: int, language_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Generate mock documents for testing outside Dataiku"""
-        languages = [language_filter] if language_filter else ["en", "fr", "de", "es", "it"]
-        mock_docs = []
-        
-        for i in range(sample_size):
-            lang = languages[i % len(languages)]
-            content = f"This is a sample document {i} in {lang} language. It contains some important information about a product or service."
-            if lang == "fr":
-                content = f"Ceci est un exemple de document {i} en français. Il contient des informations importantes sur un produit ou service."
-            elif lang == "de":
-                content = f"Dies ist ein Beispieldokument {i} in deutscher Sprache. Es enthält wichtige Informationen über ein Produkt oder eine Dienstleistung."
-                
-            mock_docs.append({
-                "document_id": f"doc_{i}",
-                "content": content,
-                "metadata": {
-                    "language": lang,
-                    "project": f"project_{i % 3}",
-                    "source_kb": f"kb_{i % 2}",
-                    "created_at": datetime.now().isoformat()
-                }
-            })
-            
-        return mock_docs
-        
-    async def evaluate_retrieval(
-        self, 
-        documents: List[Dict[str, Any]], 
-        query_strategy: str = "synthetic"
-    ) -> EvalResult:
-        """
-        Evaluate retrieval quality using SentRev
-        
-        Args:
-            documents: List of document dictionaries
-            query_strategy: Strategy for query generation ('synthetic' or 'extract')
-            
-        Returns:
-            Evaluation results
-        """
-        logger.info(f"Starting retrieval evaluation with {len(documents)} documents")
-        
-        # Define async wrapper for retrieval function
-        async def retrieval_wrapper(query: str, **kwargs):
-            # Call the retrieval function and format results for SentRev
-            try:
-                results = self.retrieval_function(query)
-                formatted_results = []
-                
-                for i, result in enumerate(results[:10]):  # Top 10 results only
-                    # Handle different result formats (dict or object)
-                    if isinstance(result, dict):
-                        content = result.get("content", "")
-                        doc_id = result.get("id", f"result_{i}")
-                        score = result.get("score", 1.0 - (i * 0.1))
-                    else:
-                        # Assume object with attributes
-                        content = getattr(result, "content", "") or getattr(result, "page_content", "")
-                        metadata = getattr(result, "metadata", {}) or {}
-                        doc_id = metadata.get("id", f"result_{i}")
-                        score = metadata.get("score", 1.0 - (i * 0.1))
-                        
-                    formatted_results.append({
-                        "content": content,
-                        "document_id": doc_id,
-                        "score": score
-                    })
-                    
-                return formatted_results
-            except Exception as e:
-                logger.error(f"Error in retrieval function: {str(e)}")
-                return []
-        
-        # Run evaluation
-        eval_results = await self.evaluator.evaluate(
-            documents=documents,
-            retrieval_fn=retrieval_wrapper,
-            query_generation_strategy=query_strategy
-        )
-        
-        return eval_results
-        
-    def save_results_to_dataiku(self, eval_results: EvalResult, run_id: Optional[str] = None):
-        """
-        Save evaluation results to Dataiku
-        
-        Args:
-            eval_results: Evaluation results from SentRev
-            run_id: Optional identifier for this evaluation run
-        """
-        try:
-            # Dataiku Python API import
-            import dataiku
-            
-            # Get output folder
-            folder = dataiku.Folder(self.results_folder)
-            
-            # Generate run ID if not provided
-            if not run_id:
-                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                
-            # Save summary metrics
-            metrics_path = f"retrieval_metrics_{run_id}.json"
-            with folder.get_writer(metrics_path) as writer:
-                writer.write(json.dumps(eval_results.metrics, indent=2))
-                
-            # Save detailed results
-            details_path = f"retrieval_details_{run_id}.csv"
-            df = eval_results.to_dataframe()
-            with folder.get_writer(details_path) as writer:
-                writer.write(df.to_csv(index=False))
-                
-            logger.info(f"Saved evaluation results to Dataiku folder: {self.results_folder}")
-            
-        except ImportError:
-            # Fallback for non-Dataiku environments
-            logger.warning("Dataiku not available - saving to local files")
-            
-            if not run_id:
-                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                
-            # Save to local files
-            with open(f"{self.results_folder}/retrieval_metrics_{run_id}.json", "w") as f:
-                json.dump(eval_results.metrics, f, indent=2)
-                
-            eval_results.to_dataframe().to_csv(
-                f"{self.results_folder}/retrieval_details_{run_id}.csv", 
-                index=False
-            )
-            
-    def create_evaluation_dashboard(self, limit: int = 10):
-        """
-        Create evaluation dashboard in Dataiku
-        
-        Args:
-            limit: Maximum number of recent evaluations to include
-        """
-        try:
-            # Dataiku Python API import
-            import dataiku
-            from dataiku.notebooks import Notebook
-            
-            # Get output folder
-            folder = dataiku.Folder(self.results_folder)
-            
-            # Find all metrics files
-            metrics_files = [f for f in folder.list_paths_in_partition() if f.startswith("retrieval_metrics_") and f.endswith(".json")]
-            metrics_files.sort(reverse=True)  # Most recent first
-            
-            # Load metrics from each file
-            all_metrics = []
-            for file_path in metrics_files[:limit]:
-                with folder.get_download_stream(file_path) as f:
-                    metrics = json.load(f)
-                    run_id = file_path.replace("retrieval_metrics_", "").replace(".json", "")
-                    metrics["run_id"] = run_id
-                    metrics["date"] = run_id.split("_")[0]
-                    all_metrics.append(metrics)
-                    
-            # Convert to DataFrame for easy charting
-            if all_metrics:
-                metrics_df = pd.DataFrame(all_metrics)
-                
-                # Create insights notebook
-                notebook = Notebook("Retrieval Evaluation Dashboard")
-                
-                # Add title and description
-                notebook.add_markdown("# Retrieval System Evaluation Dashboard")
-                notebook.add_markdown("## Performance metrics over time")
-                
-                # Add charts
-                notebook.add_chart(
-                    metrics_df, 
-                    chart_type="line", 
-                    x="date", 
-                    y=["avg_relevance_score", "avg_context_precision", "mrr"],
-                    title="Key Retrieval Metrics"
-                )
-                
-                notebook.add_chart(
-                    metrics_df,
-                    chart_type="line",
-                    x="date",
-                    y="retrieval_success_rate",
-                    title="Retrieval Success Rate"
-                )
-                
-                # Add data table
-                notebook.add_dataframe(metrics_df, title="Evaluation Runs")
-                
-                # Save notebook
-                notebook.save("Retrieval_Evaluation_Dashboard")
-                logger.info("Created evaluation dashboard in Dataiku")
-            else:
-                logger.warning("No evaluation data found to create dashboard")
-                
-        except ImportError:
-            # Fallback for non-Dataiku environments
-            logger.warning("Dataiku not available - cannot create dashboard")
+import dataiku
+import asyncio
+import json
+import logging
+from datetime import datetime
+import nest_asyncio
 
-    async def run_evaluation_job(
-        self,
-        sample_size: int = 100,
-        project_filter: Optional[str] = None,
-        language_filter: Optional[str] = None,
-        query_strategy: str = "synthetic",
-        create_dashboard: bool = True
-    ):
-        """
-        Run complete evaluation workflow
-        
-        Args:
-            sample_size: Number of documents to sample
-            project_filter: Optional filter for specific project
-            language_filter: Optional filter for specific language
-            query_strategy: Strategy for query generation
-            create_dashboard: Whether to create/update dashboard
-            
-        Returns:
-            Evaluation results
-        """
-        try:
-            start_time = datetime.now()
-            run_id = start_time.strftime("%Y%m%d_%H%M%S")
-            logger.info(f"Starting evaluation run {run_id}")
-            
-            # Load documents from Dataiku
-            documents = await self.load_documents_from_dataiku(
-                sample_size=sample_size,
-                project_filter=project_filter,
-                language_filter=language_filter
-            )
-            
-            if not documents:
-                logger.error("No documents found for evaluation")
-                return None
-                
-            # Run evaluation
-            eval_results = await self.evaluate_retrieval(
-                documents=documents,
-                query_strategy=query_strategy
-            )
-            
-            # Save results
-            self.save_results_to_dataiku(eval_results, run_id)
-            
-            # Create dashboard
-            if create_dashboard:
-                self.create_evaluation_dashboard()
-                
-            # Log summary
-            duration = (datetime.now() - start_time).total_seconds()
-            logger.info(f"Evaluation completed in {duration:.1f} seconds")
-            logger.info(f"Results: MRR={eval_results.metrics['mrr']:.3f}, " +
-                        f"Avg Relevance={eval_results.metrics['avg_relevance_score']:.3f}")
-                
-            return eval_results
-            
-        except Exception as e:
-            logger.error(f"Error in evaluation job: {str(e)}")
-            return None
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("rag_pipeline_interactive")
 
-# Example Dataiku recipe implementation
-def process(input_datasets, output_datasets, output_folders):
-    """Dataiku recipe entry point"""
-    # Configure your retrieval function
-    def retrieval_function(query):
-        # Replace with your actual retrieval logic
-        # This should call your retrieval_service or knowledge_service
-        # Example:
-        # return retrieval_service.search(query)
-        return []  # Placeholder
-    
-    # Initialize evaluator
-    evaluator = DataikuRetrievalEvaluator(
-        retrieval_function=retrieval_function,
-        kb_dataset_name=input_datasets[0],  # First input dataset
-        results_folder=output_folders[0]     # First output folder
-    )
-    
-    # Create event loop and run evaluation
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
+
+# Import the core components
+from knowledge_service import KnowledgeService
+from translation_service import TranslationService
+from retrieval_service import RetrievalService
+from pipeline_orchestrator import RAGPipeline
+
+# Initialize services
+knowledge_service = KnowledgeService(kb_ids=["F4mLJDV3", "p4wVMEbK"])
+translation_service = TranslationService()
+retrieval_service = RetrievalService()
+pipeline = RAGPipeline(knowledge_service, translation_service, retrieval_service)
+
+# Define observation keys for formatting
+OBSERVATION_KEYS = [
+    "category_id", "project", "country", "fleet", "subsystem", "database",
+    "observation_category", "obs_id", "failure_class", "problem_code", "problem_cause",
+    "problem_remedy", "functional_location", "notifications_number", "date",
+    "solution_category", "pbs_code", "symptom_code", "root_cause", "document_link",
+    "language", "resource", "min_resources_need", "max_resources_need",
+    "the_most_frequent_value_for_resource", "time", "min_time_per_one_person",
+    "max_time_per_one_person", "average_time", "frequency_obs", "frequency_sol",
+    "min_resources_need_sol", "max_resources_need_sol",
+    "the_most_frequent_value_for_resource_sol", "min_time_per_one_person_sol",
+    "max_time_per_one_person_sol", "average_time_sol", "sol_category_id"
+]
+
+async def interactive_query(pipeline_instance):
+    """Interactive query process with the RAG pipeline."""
     try:
-        eval_results = loop.run_until_complete(evaluator.run_evaluation_job(
-            sample_size=100,
-            project_filter=None,  # Set to project name or None
-            language_filter=None  # Set to language code or None
-        ))
-        
-        if eval_results:
-            print("Evaluation completed successfully")
-        else:
-            print("Evaluation failed")
+        print("\n=== Multilingual RAG System ===\n")
+        query = input("Enter your query: ")
+        if not query.strip():
+            print("Error: Query cannot be empty.")
+            return
             
+        source_lang = input("Enter source language (or press Enter for auto-detection): ").strip().lower()
+        if not source_lang:
+            source_lang = "auto"
+            print("Using automatic language detection")
+        else:
+            print(f"Using specified language: {source_lang}")
+        
+        target_lang = input("Enter target language (or press Enter to use same as source): ").strip().lower()
+        if not target_lang:
+            target_lang = None
+            print("Results will be returned in the same language as the query")
+        else:
+            print(f"Results will be translated to: {target_lang}")
+        
+        search_type = input("Search type (global/local): ").strip().lower()
+        if search_type not in ["global", "local"]:
+            print("Invalid search type. Defaulting to global.")
+            search_type = "global"
+            
+        project_name = None
+        project_filter = {}
+        if search_type == "local":
+            project_name = input("Enter project name: ").strip()
+            if project_name:
+                project_filter["project"] = project_name
+                print(f"Filtering results for project: {project_name}")
+            else:
+                print("No project specified, using global search")
+                search_type = "global"
+        
+        print("\nProcessing your query...")
+        start_time = datetime.now()
+        print(f"Started at: {start_time.strftime('%H:%M:%S')}")
+        
+        # Process query through pipeline
+        response = await pipeline_instance.process_query(
+            query=query,
+            source_language=source_lang,
+            target_language=target_lang,
+            search_type=search_type,
+            project_name=project_name
+        )
+        
+        if response.get("status") != "success":
+            print(f"\nError: {response.get('error', 'Unknown error')}")
+            return
+            
+        # Extract results
+        results = response.get("results", [])
+        metadata = response.get("metadata", {})
+        detected_language = metadata.get("detected_language", source_lang)
+        target_language = metadata.get("target_language", detected_language)
+        
+        # Extract metadata fields from results
+        translated_observations = []
+        translated_solutions = []
+
+        logger.info(f"Processing {len(results)} results for translations")
+        for i, result in enumerate(results):
+            logger.debug(f"Result {i+1} type: {type(result)}")
+            
+            # Access metadata with fallbacks
+            result_metadata = {}
+            if hasattr(result, "metadata") and result.metadata:
+                result_metadata = result.metadata
+            elif isinstance(result, dict) and "metadata" in result:
+                result_metadata = result["metadata"]
+            elif isinstance(result, dict):
+                # Treat the result itself as metadata
+                result_metadata = result
+                
+            # Extract observation using the observation_final_translated field
+            obs_content = result_metadata.get("observation_final_translated", "")
+            if obs_content:
+                translated_observations.append(obs_content)
+                logger.debug(f"Found observation in result metadata")
+                
+            # Extract solution using the solution_final_translated field  
+            sol_content = result_metadata.get("solution_final_translated", "")
+            if sol_content:
+                translated_solutions.append(sol_content)
+                logger.debug(f"Found solution in result metadata")
+
+        logger.info(f"Extracted {len(translated_observations)} observations and {len(translated_solutions)} solutions")
+        
+        # Format results for display
+        formatted_results = format_results(
+            results=results,
+            filter_criteria=project_filter,
+            source_language=detected_language,
+            translated_observations=translated_observations,
+            translated_solutions=translated_solutions
+        )
+        
+        # Add metadata to formatted results
+        formatted_results["metadata"] = {
+            "query": query,
+            "detected_language": detected_language,
+            "target_language": target_language,
+            "search_type": search_type,
+            "project_filter": project_name or "",
+            "total_time_seconds": response.get("total_time", 0),
+            "timestamp": datetime.now().isoformat(),
+            "query_variations": metadata.get("query_variations", [])
+        }
+        
+        # Display summary
+        result_count = len(formatted_results["response"]["observation_results"])
+        print(f"\nFound {result_count} results in {response.get('total_time', 0):.2f} seconds")
+        
+        if detected_language != "auto" and detected_language != source_lang:
+            print(f"Detected language: {detected_language}")
+                
+        if "english_query" in metadata and metadata["english_query"] != query:
+            print(f"Translated query: {metadata['english_query']}")
+            
+        if "query_variations" in metadata and metadata["query_variations"]:
+            print(f"Query variations used:")
+            for i, var in enumerate(metadata["query_variations"][:3], 1):
+                print(f"  {i}. {var}")
+            if len(metadata["query_variations"]) > 3:
+                print(f"  ...and {len(metadata['query_variations'])-3} more")
+        
+        # Print results
+        print("\nResults (JSON format):")
+        print(json.dumps(formatted_results, indent=2, ensure_ascii=False))
+        
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        logger.error(f"Error in interactive query: {str(e)}", exc_info=True)
+
+def format_results(results, filter_criteria, source_language, translated_observations, translated_solutions):
+    """Format results into the desired JSON structure."""
+    formatted_results = {"response": {"observation_results": []}}
+    
+    logger.info(f"Formatting {len(results)} results with filters: {filter_criteria}")
+    logger.info(f"Translated obs count: {len(translated_observations)}, sols count: {len(translated_solutions)}")
+    
+    obs_index = 0
+    sol_index = 0
+    
+    for idx, result in enumerate(results, start=1):
+        # Extract metadata more robustly
+        if hasattr(result, "metadata"):
+            metadata = result.metadata
+        elif isinstance(result, dict) and "metadata" in result:
+            metadata = result["metadata"]
+        elif isinstance(result, dict):
+            # If result itself is a dictionary with fields, use it directly
+            metadata = result
+        else:
+            logger.warning(f"Could not extract metadata from result #{idx}")
+            metadata = {}
+            
+        # Apply filters
+        match = True
+        for key, value in filter_criteria.items():
+            if value and str(metadata.get(key, "")).lower() != str(value).lower():
+                logger.info(f"Filtering out result #{idx} - {key}:{metadata.get(key,'')} != {value}")
+                match = False
+                break
+                
+        if not match:
+            continue
+        
+        # Create observation with proper field extraction
+        observation = {}
+        
+        # Copy directly available observation keys from metadata
+        for key in OBSERVATION_KEYS:
+            # Try multiple ways to get the field
+            if key in metadata:
+                observation[key] = metadata[key]
+            elif hasattr(result, key):
+                observation[key] = getattr(result, key)
+            else:
+                observation[key] = ""
+                
+        observation["ranking"] = idx
+        
+        # Get observation_final_translated and solution_final_translated  
+        obs_content = metadata.get("observation_final_translated", "")
+        sol_content = metadata.get("solution_final_translated", "")
+            
+        # Add observation content
+        if obs_content and obs_index < len(translated_observations):
+            observation["observation"] = translated_observations[obs_index]
+            obs_index += 1
+        else:
+            observation["observation"] = obs_content
+            
+        # Add solution content
+        if sol_content and sol_index < len(translated_solutions):
+            observation["solution"] = translated_solutions[sol_index]
+            sol_index += 1
+        else:
+            observation["solution"] = sol_content
+            
+        formatted_results["response"]["observation_results"].append(observation)
+    
+    logger.info(f"Formatted {len(formatted_results['response']['observation_results'])} results after filtering")
+    return formatted_results
+        
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(interactive_query(pipeline))
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user")
+    except Exception as e:
+        print(f"\nCritical error: {str(e)}")
+        logger.critical(f"Critical error in main loop: {str(e)}", exc_info=True)
     finally:
-        loop.close()
+        print("\nThank you for using the Multilingual Retrieval System")
